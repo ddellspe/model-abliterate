@@ -1,5 +1,8 @@
 # Gemma 4 (26B-A4B-it) Abliteration & Representation Engineering Guide
 
+> [!NOTE]
+> The primary dedicated model runbook is available at [`models/gemma4-26b-a4b/README.md`](../models/gemma4-26b-a4b/README.md).
+
 ## 1. Executive Summary & Cluster Status
 
 | Component | Status | Description |
