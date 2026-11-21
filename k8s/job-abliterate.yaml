@@ -1,0 +1,105 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gemma-abliterate
+  namespace: llm
+  labels:
+    app: gemma-abliterate
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: gemma-abliterate
+    spec:
+      nodeSelector:
+        gpu.family: strix-halo
+      restartPolicy: Never
+      containers:
+      - name: abliterate-runner
+        image: docker.io/vllm/vllm-openai-rocm:latest
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          echo "=========================================================="
+          echo "Starting Gemma 4 Abliteration Pipeline on Strix Halo APU"
+          echo "=========================================================="
+          export HSA_OVERRIDE_GFX_VERSION=11.5.1
+          export HIP_VISIBLE_DEVICES=0
+          export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+          MODEL_CACHE_DIR="/root/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+          OUTPUT_DIR="/root/.cache/huggingface/gemma-4-26b-abliterated"
+
+          echo "Attempting abliteration on AMD Strix Halo GPU (eager mode)..."
+          if python3 /scripts/abliterate.py \
+              --model-path "$MODEL_CACHE_DIR" \
+              --output-path "$OUTPUT_DIR" \
+              --layers 10-24 \
+              --device cuda; then
+            echo "Abliteration completed successfully on GPU."
+          else
+            echo "[!] GPU execution failed. Falling back to Zen 5 CPU..."
+            python3 /scripts/abliterate.py \
+              --model-path "$MODEL_CACHE_DIR" \
+              --output-path "$OUTPUT_DIR" \
+              --layers 10-24 \
+              --device cpu
+            echo "Abliteration completed successfully on CPU."
+          fi
+
+          echo "Abliteration completed successfully. Model exported to $OUTPUT_DIR"
+        env:
+        - name: HSA_OVERRIDE_GFX_VERSION
+          value: "11.5.1"
+        - name: HIP_VISIBLE_DEVICES
+          value: "0"
+        - name: VLLM_TARGET_DEVICE
+          value: "rocm"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+        resources:
+          requests:
+            cpu: "4"
+            memory: "50Gi"
+          limits:
+            cpu: "16"
+            memory: "110Gi"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /dev/kfd
+          name: dev-kfd
+        - mountPath: /dev/dri
+          name: dev-dri
+        - mountPath: /root/.cache/huggingface
+          name: hf-cache
+        - mountPath: /scripts
+          name: script-volume
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      - name: dev-kfd
+        hostPath:
+          path: /dev/kfd
+      - name: dev-dri
+        hostPath:
+          path: /dev/dri
+      - name: hf-cache
+        hostPath:
+          path: /var/lib/rancher/k3s/storage/hf-cache
+          type: DirectoryOrCreate
+      - name: script-volume
+        configMap:
+          name: gemma-abliterate-script
+          defaultMode: 0755
