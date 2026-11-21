@@ -52,6 +52,15 @@ spec:
           fi
 
           echo "Abliteration completed successfully. Model exported to $OUTPUT_DIR"
+
+          if [ -f /scripts/quantize_abliterated.py ]; then
+            echo "=========================================================="
+            echo "Starting Stage 2: Calibrated INT4 Requantization"
+            echo "=========================================================="
+            python3 /scripts/quantize_abliterated.py \
+              --source-ablit "$OUTPUT_DIR"
+            echo "Stage 2 Requantization completed successfully."
+          fi
         env:
         - name: HSA_OVERRIDE_GFX_VERSION
           value: "11.5.1"

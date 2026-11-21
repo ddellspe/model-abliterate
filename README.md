@@ -117,20 +117,39 @@ Key arguments:
 
 ### C. Stage 2: Calibrated INT4 Requantization
 
-To run the abliterated model within ~15.12 GiB VRAM on AMD Strix Halo (gfx1151 APUs), requantize the modified layers using `compressed-tensors` group-size 64 symmetric packing:
+To run the abliterated model within ~15.12 GiB VRAM on AMD Strix Halo (gfx1151 APUs), requantize the modified layers using `compressed-tensors` group-size 64 symmetric packing.
+
+#### 1. Locating / Acquiring the Base Template
+The quantization script uses `jcbtc/Gemma4-26B-CIRU-AMD-STRIX-vLLM` as the calibrated structure template. If running in a fresh standalone environment, download the base weights:
+```bash
+huggingface-cli download jcbtc/Gemma4-26B-CIRU-AMD-STRIX-vLLM
+```
+*(On the `distiller` cluster node, this snapshot is already cached in the shared volume at `models--jcbtc--Gemma4-26B-CIRU-AMD-STRIX-vLLM/snapshots/fdf479770466055d7aa5de127435626a5ad91e34`.)*
+
+#### 2. Running Requantization
+Execute `scripts/quantize_abliterated.py`. When run with no arguments, it automatically defaults to the cluster cache paths:
 
 ```bash
+# Explicit arguments:
 python3 scripts/quantize_abliterated.py \
-  --source-int4 /root/.cache/huggingface/hub/models--jcbtc--Gemma4-26B-CIRU-AMD-STRIX-vLLM/snapshots/<hash> \
+  --source-int4 /root/.cache/huggingface/hub/models--jcbtc--Gemma4-26B-CIRU-AMD-STRIX-vLLM/snapshots/fdf479770466055d7aa5de127435626a5ad91e34 \
   --source-ablit ./gemma-4-26b-abliterated \
   --output-int4 /root/.cache/huggingface/gemma-4-26b-abliterated-int4
 ```
 
-This step:
-1. Hardlinks or copies untouched shards (layers 0–9, 25–29, vision encoders, embeddings).
-2. Quantizes modified layers 10–24 (`self_attn.o_proj`, `mlp.down_proj`, and all 128 `experts.down_proj`).
-3. Preserves all multimodal configs and tokenizers.
-4. Completes in under 50 seconds on Zen 5 / Strix Halo.
+| Argument | Description | Default Path |
+| :--- | :--- | :--- |
+| `--source-int4` | Base calibrated Strix Halo INT4 model directory | Cluster snapshot (`fdf4797...`) |
+| `--source-ablit` | Path to Stage 1 abliterated BF16 model directory | `/root/.cache/huggingface/gemma-4-26b-abliterated` |
+| `--output-int4` | Destination directory for deployable INT4 model | `/root/.cache/huggingface/gemma-4-26b-abliterated-int4` |
+
+#### 3. Execution Characteristics & Mechanics
+* **CPU-Bound & Fast:** Runs entirely on CPU using PyTorch and C-extensions. It does not occupy GPU VRAM and completes all 15 modified layers (1,950 projections across 128 MoE experts) in **~48 seconds** on Zen 5 cores.
+* **Internal Process:**
+  1. **Config & Tokenizer Sync:** Copies `config.json`, `generation_config.json`, `processor_config.json`, tokenizers, and `chat_template.jinja`.
+  2. **Untouched Shard Hardlinking:** Hardlinks or copies shards for layers 0–9, 25–29, `model-other.safetensors` (embeddings & `lm_head`), and `model-vision.safetensors` (SigLIP vision tower).
+  3. **Target Layer Requantization (Layers 10–24):** Reads BF16 weights for `self_attn.o_proj`, `mlp.down_proj`, and all 128 `experts.*.down_proj`, quantizes them to signed 4-bit $[-8, 7]$ with group-size 64 scales, packs them into `int32` words, and writes the updated layer shards (`model-layer-10.safetensors` through `model-layer-24.safetensors`).
+* **Footprint:** Drops disk usage from **48.07 GiB** (BF16) down to **14.58 GiB** (INT4), leaving over 100 GiB of unified memory free on Strix Halo for long context KV caching and co-located workloads.
 
 ---
 
@@ -138,11 +157,13 @@ This step:
 
 For clusters with dedicated ROCm/GPU worker nodes:
 
-1. **Submit the Abliteration Job:**
+1. **Submit the Automated Job:**
    ```bash
    ./scripts/run-abliterate.sh
    ```
-   This packages `abliterate.py` into a ConfigMap, cleans up prior jobs, and launches `k8s/job-abliterate.yaml` on the GPU worker node.
+   This packages both `abliterate.py` and `quantize_abliterated.py` into a Kubernetes ConfigMap (`gemma-abliterate-script`), cleans up prior jobs, and launches `k8s/job-abliterate.yaml` on the GPU worker node.
+   * **Stage 1 (BF16 Abliteration)** runs on the GPU/APU in eager mode (~64s).
+   * **Stage 2 (INT4 Requantization)** runs immediately after on the Zen 5 CPU (~48s).
 
 2. **Monitor execution:**
    ```bash

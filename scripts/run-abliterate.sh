@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 echo "Creating/updating ConfigMap 'gemma-abliterate-script' in namespace 'llm'..."
 kubectl create configmap gemma-abliterate-script \
   --from-file=abliterate.py="${SCRIPT_DIR}/abliterate.py" \
+  --from-file=quantize_abliterated.py="${SCRIPT_DIR}/quantize_abliterated.py" \
   -n llm --dry-run=client -o yaml | kubectl apply -f -
 
 echo "Cleaning up any previous job run..."
