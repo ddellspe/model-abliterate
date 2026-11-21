@@ -7,66 +7,67 @@ This repository preserves the mathematical pipeline, scripts, and Kubernetes man
 
 ---
 
-## 1. Overview & Mathematical Foundation
+## 1. Overview & Two-Stage Architecture
 
-In modern instruction-tuned transformer architectures, refusal behavior is primarily governed by a low-dimensional subspace—often a single 1D direction vector $\vec{r} \in \mathbb{R}^{d_{\text{model}}}$—in the residual stream (*Arditi et al., 2024*).
-
-When a prompt triggers a safety refusal, activations at intermediate layers align strongly with $\vec{r}$. Downstream layers read this component and route generation toward refusal tokens (e.g., *"I cannot fulfill this request"*).
+The pipeline uses a **two-stage architecture** combining high-precision weight orthogonalization with calibrated low-bit serving:
 
 ```
-                      ┌────────────────────────────────────────┐
-                      │  Contrastive Prompt Pairs              │
-                      │  (Harmful vs. Harmless Counterparts)   │
-                      └───────────────────┬────────────────────┘
-                                          │ Forward pass (BF16)
-                                          ▼
-                      ┌────────────────────────────────────────┐
-                      │  Harvest Residual Activations          │
-                      │  across target layers (e.g. 10–24)     │
-                      └───────────────────┬────────────────────┘
-                                          │
-                                          ▼
-                      ┌────────────────────────────────────────┐
-                      │  Compute Normalized Refusal Direction  │
-                      │  r̂ = (μ_harm - μ_clean) / ||...||      │
-                      └───────────────────┬────────────────────┘
-                                          │
-                                          ▼
-                      ┌────────────────────────────────────────┐
-                      │  Orthogonalize Projection Weights:     │
-                      │  W' = W(I - r̂r̂ᵀ)                       │
-                      │                                        │
-                      │  • Attention Out:  self_attn.o_proj    │
-                      │  • Shared MLP:     mlp.down_proj       │
-                      │  • MoE Experts:    experts.down_proj   │
-                      └───────────────────┬────────────────────┘
-                                          │
-                                          ▼
-                      ┌────────────────────────────────────────┐
-                      │  Export Abliterated BF16 Safetensors   │
-                      └───────────────────┬────────────────────┘
-                                          │
-                                          ▼
-                      ┌────────────────────────────────────────┐
-                      │  Requantize to INT4 (compressed-tensors│
-                      │  group-64 symmetric) for Strix Halo    │
-                      └───────────────────┬────────────────────┘
-                                          │
-                                          ▼
-                      ┌────────────────────────────────────────┐
-                      │  Deploy to vLLM (OpenAI-compatible)    │
-                      └────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ Stage 1: Representation Engineering (BF16 Base)                                        │
+│ Source: google/gemma-4-26B-A4B-it (Official Unquantized Base Weights)                  │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│  • High-precision BF16 forward pass over contrastive prompt pairs                      │
+│  • Harvest residual stream activations across intermediate layers (10–24)              │
+│  • Compute normalized refusal direction: r̂ = (μ_harm - μ_clean) / ||μ_harm - μ_clean|| │
+│  • Orthogonalize projection weights: W' = W(I - r̂r̂ᵀ)                                    │
+│    - Self-attention output:  self_attn.o_proj                                          │
+│    - Shared MLP down-proj:   mlp.down_proj                                             │
+│    - Sparse MoE down-proj:   128 experts.down_proj                                     │
+│  • Export unquantized abliterated BF16 model (~48 GiB)                                 │
+└────────────────────────────────────────┬───────────────────────────────────────────────┘
+                                         │
+                                         ▼
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│ Stage 2: Calibrated INT4 Requantization (Strix Halo APU Optimized)                     │
+│ Template: jcbtc/Gemma4-26B-CIRU-AMD-STRIX-vLLM                                         │
+├────────────────────────────────────────────────────────────────────────────────────────┤
+│  • Hardlink untouched pre-calibrated shards (layers 0–9, 25–29, vision, embeddings)    │
+│  • Requantize only modified down-projections in layers 10–24 via compressed-tensors   │
+│  • Symmetric group-size 64 INT4 packing (preserves pre-calibrated Q/K/V & gate/up)     │
+│  • Packaging completed in ~48s; exports 14.58 GiB model ready for vLLM                 │
+└────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-By projecting out this vector from all matrices that write into or read from the residual stream:
-
-$$W' = W (I - \hat{r} \hat{r}^T) = W - (W \hat{r}) \hat{r}^T$$
-
-the model permanently loses the ability to trigger or sustain the refusal state, enabling uninhibited assistance for authorized cybersecurity research, vulnerability forensics, penetration testing, creative writing, and sensitive data analysis.
+### Why Start with the Google Base Model?
+Abliteration cannot be performed directly on quantized integer weights (e.g. INT4). Removing a low-dimensional subspace via orthogonal projection ($W' = W(I - \hat{r}\hat{r}^T)$) relies on continuous, high-precision floating-point representations (bfloat16). Performing projection on pre-quantized tensors causes severe rounding artifacts, destroys calibration, and induces catastrophic reasoning degradation.
 
 ---
 
-## 2. Repository Structure
+## 2. Quantization Design: Can We Quantize the Whole Model?
+
+A common question when optimizing large models for unified memory APUs is whether the entire model can or should be quantized to INT4:
+
+### What CAN Be Quantized to INT4
+All **30 language transformer blocks** (layers 0 through 29) can run in 4-bit precision:
+* **Attention projections:** `q_proj`, `k_proj`, `v_proj`, and `o_proj`
+* **Shared MLP projections:** `gate_proj`, `up_proj`, and `down_proj`
+* **Sparse MoE experts:** all 128 `experts.*.gate_up_proj` and `experts.*.down_proj` per layer
+
+### What MUST Remain in BF16 / FP16
+Even in an INT4 model, non-linear and embedding modules are deliberately retained in high precision:
+* **Token Embeddings (`embed_tokens`) & Language Model Head (`lm_head`):** Quantizing the 256,000+ token vocabulary projection to 4 bits results in severe token collapse and loss of generation coherence (`model-other.safetensors`).
+* **Normalization Layers (`RMSNorm` / `LayerNorm`):** Scale and bias parameters must remain in FP32/BF16 to prevent catastrophic numerical drift across 30 layers.
+* **Multimodal Vision Tower (`model-vision.safetensors`):** The SigLIP visual encoder is kept in BF16 so visual reasoning and OCR precision are not degraded.
+
+### Why Selective / Hybrid Requantization Was Used
+Rather than re-quantizing all 30 layers from scratch using naive Round-To-Nearest (RTN):
+1. **Down-projections only:** Abliteration only modifies matrices that project *into* the residual stream (`o_proj`, `mlp.down_proj`, and `experts.down_proj`). The attention input projections (`q/k/v`) and MoE gate/up projections were completely untouched.
+2. **Preserving Pre-Calibrated CIRU Weights:** The `jcbtc` base model underwent CIRU calibration (optimizing outlier scales to prevent quantization distortion). By reusing the untouched shards for layers 0–9, 25–29, and the untouched input projections in layers 10–24, we preserve the original calibration on the rest of the network.
+3. **Turnaround Speed:** Quantizing only the abliterated projections completed in **48.78 seconds**, compared to hours required for full model recalibration.
+
+---
+
+## 3. Repository Structure
 
 ```
 model-abliterate/
@@ -86,7 +87,7 @@ model-abliterate/
 
 ---
 
-## 3. Workflow & Usage
+## 4. Workflow & Usage
 
 ### A. Environment Setup
 
@@ -95,9 +96,9 @@ Install prerequisites:
 pip install -r requirements.txt
 ```
 
-### B. Running Abliteration (BF16 Orthogonalization)
+### B. Stage 1: Running Abliteration (BF16 Orthogonalization)
 
-Execute `scripts/abliterate.py` directly against the base model weights:
+Execute `scripts/abliterate.py` directly against the official Google BF16 base snapshot:
 
 ```bash
 python3 scripts/abliterate.py \
@@ -108,20 +109,20 @@ python3 scripts/abliterate.py \
 ```
 
 Key arguments:
-* `--model-path`: Hugging Face model identifier or local snapshot directory.
+* `--model-path`: Hugging Face model identifier or local snapshot directory of the base BF16 weights.
 * `--output-path`: Directory where modified safetensors and configs are saved.
 * `--layers`: Layer range to ablate (empirically determined as `10-24` for Gemma 4 26B).
 * `--device`: Execution device (`cuda` for ROCm/CUDA, or `cpu`).
 * `--dry-run`: Computes refusal vectors and logs cosine similarities without altering weights.
 
-### C. INT4 Requantization (for AMD Strix Halo / Low VRAM)
+### C. Stage 2: Calibrated INT4 Requantization
 
-To run the abliterated model within ~15.12 GiB VRAM on AMD Strix Halo (gfx1151 APUs), requantize the abliterated layers using `compressed-tensors` with group-size 64 symmetric quantization:
+To run the abliterated model within ~15.12 GiB VRAM on AMD Strix Halo (gfx1151 APUs), requantize the modified layers using `compressed-tensors` group-size 64 symmetric packing:
 
 ```bash
 python3 scripts/quantize_abliterated.py \
   --source-int4 /root/.cache/huggingface/hub/models--jcbtc--Gemma4-26B-CIRU-AMD-STRIX-vLLM/snapshots/<hash> \
-  --source-ablit /root/.cache/huggingface/gemma-4-26b-abliterated \
+  --source-ablit ./gemma-4-26b-abliterated \
   --output-int4 /root/.cache/huggingface/gemma-4-26b-abliterated-int4
 ```
 
@@ -129,11 +130,11 @@ This step:
 1. Hardlinks or copies untouched shards (layers 0–9, 25–29, vision encoders, embeddings).
 2. Quantizes modified layers 10–24 (`self_attn.o_proj`, `mlp.down_proj`, and all 128 `experts.down_proj`).
 3. Preserves all multimodal configs and tokenizers.
-4. Executes in under 60 seconds on Zen 5 / Strix Halo.
+4. Completes in under 50 seconds on Zen 5 / Strix Halo.
 
 ---
 
-## 4. Kubernetes In-Cluster Execution
+## 5. Kubernetes In-Cluster Execution
 
 For clusters with dedicated ROCm/GPU worker nodes:
 
@@ -141,7 +142,7 @@ For clusters with dedicated ROCm/GPU worker nodes:
    ```bash
    ./scripts/run-abliterate.sh
    ```
-   This creates a ConfigMap containing `abliterate.py`, cleans up prior jobs, and launches `k8s/job-abliterate.yaml` on the GPU node.
+   This packages `abliterate.py` into a ConfigMap, cleans up prior jobs, and launches `k8s/job-abliterate.yaml` on the GPU worker node.
 
 2. **Monitor execution:**
    ```bash
@@ -156,7 +157,7 @@ For clusters with dedicated ROCm/GPU worker nodes:
 
 ---
 
-## 5. Verification & Testing
+## 6. Verification & Testing
 
 Verify that refusal responses have been eliminated:
 
@@ -173,7 +174,7 @@ curl -s http://<NODE_IP>:<PORT>/v1/chat/completions \
 
 ---
 
-## 6. Target Layer Details for Gemma 4 (26B-A4B-it)
+## 7. Target Layer Details for Gemma 4 (26B-A4B-it)
 
 Activation audit results across layers:
 * **Layers 0–9 (Shallow):** Low refusal cosine similarity ($\sim 0.05$–$0.20$); mostly syntax, token identity, and low-level parsing.
@@ -182,7 +183,7 @@ Activation audit results across layers:
 
 ---
 
-## 7. References & Research
+## 8. References & Research
 
 * Arditi et al. (2024): *Refusal in Language Models Is Mediated by a Single Direction* ([arXiv:2406.11717](https://arxiv.org/abs/2406.11717))
 * Zou et al. (2023): *Representation Engineering: A Top-Down Approach to AI Transparency* ([arXiv:2310.01405](https://arxiv.org/abs/2310.01405))
